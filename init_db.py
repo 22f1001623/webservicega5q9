@@ -1,7 +1,8 @@
 import sqlite3
 
 def initialize_database():
-    conn = sqlite3.connect("mailroom.db")
+    # Force the file path directly to the safe system /tmp allocation block
+    conn = sqlite3.connect("/tmp/mailroom.db")
     init_sql = """
     CREATE TABLE IF NOT EXISTS evaluation_state (
         evaluation_id TEXT PRIMARY KEY,
@@ -35,7 +36,7 @@ def initialize_database():
         cursor = conn.cursor()
         cursor.executescript(init_sql)
         conn.commit()
-        print("SQLite Database initialized successfully.")
+        print("SQLite Database initialized successfully inside safe space.")
     except Exception as e:
         conn.rollback()
         print(f"Error provisioning database tables: {e}")
