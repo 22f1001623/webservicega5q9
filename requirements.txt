@@ -1,15 +1,3 @@
-# Web Framework and Server
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
-
-# Data Validation and Parsing
 pydantic>=2.6.0
-
-# Database Connectivity (Choose based on your database engine)
-# For PostgreSQL deployments (e.g., Supabase, Neon, AWS RDS):
-psycopg2-binary>=2.9.9
-# For async PostgreSQL (if required by your driver layer):
-# asyncpg>=0.29.0
-
-# HTTP Client for AI / Inference Provider Upstream Communication
-httpx>=0.27.0
