@@ -9,7 +9,8 @@ from fastapi import FastAPI, HTTPException, status
 from contextlib import asynccontextmanager
 
 def get_db_connection():
-    conn = sqlite3.connect("mailroom.db")
+    # Route connection to match the temporary write-safe container directory
+    conn = sqlite3.connect("/tmp/mailroom.db")
     conn.row_factory = lambda cursor, row: {col: row[idx] for idx, col in enumerate(cursor.description)}
     return conn
 
@@ -233,4 +234,4 @@ async def handle_mailroom_operations(request_data: Dict[str, Any]):
                 p_saved = json.loads(saved["payload"]) if isinstance(saved["payload"], str) else saved["payload"]
 
                 expected_digest = compute_proposal_digest(saved["call_id"], saved["action"], t_saved, p_saved)
-                if receipt.proposalDigest != expected_digest or receipt.action != saved["action"]:
+if receipt.proposalDigest != expected_digest or receipt.action != saved["action"]:raise HTTPException(status_code=400, detail="Cryptographic verification matching anomaly detected.")cursor.execute("SELECT 1 FROM committed_receipts WHERE receipt_id = ?", (receipt.receiptId,))if not cursor.fetchone():sql_commit = "INSERT INTO committed_receipts (receipt_id, evaluation_id, dossier_id, call_id, action, proposal_digest) VALUES (?, ?, ?, ?, ?, ?)"cursor.execute(sql_commit, (receipt.receiptId, receipt.evaluationId, receipt.dossierId, receipt.callId, receipt.action, receipt.proposalDigest))outcomes_out.append({"receiptId": receipt.receiptId, "status": "executed", "action": saved["action"]})conn.commit()return {"status": "completed", "outcomes": outcomes_out}except Exception as e:conn.rollback()if isinstance(e, HTTPException):raise eraise HTTPException(status_code=500, detail=str(e))finally:cursor.close()conn.close()
