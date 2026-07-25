@@ -8,21 +8,63 @@ from pydantic import BaseModel, Field, ValidationError
 from fastapi import FastAPI, HTTPException, status
 from contextlib import asynccontextmanager
 
+# --- In-Memory Thread-Safe Global Connection Wrapper ---
+# We store the connection globally using SQLite's shared cache memory feature.
+# This prevents different worker threads from dropping data tables mid-flight.
+MEM_CONN = sqlite3.connect("file:mailroom_mem?mode=memory&cache=shared", uri=True, check_same_thread=False)
+
 def get_db_connection():
-    # Route connection to match the temporary write-safe container directory
-    conn = sqlite3.connect("/tmp/mailroom.db")
-    conn.row_factory = lambda cursor, row: {col: row[idx] for idx, col in enumerate(cursor.description)}
-    return conn
+    MEM_CONN.row_factory = lambda cursor, row: {col: row[idx] for idx, col in enumerate(cursor.description)}
+    return MEM_CONN
+
+def bootstrap_in_memory_tables():
+    cursor = MEM_CONN.cursor()
+    init_sql = """
+    CREATE TABLE IF NOT EXISTS evaluation_state (
+        evaluation_id TEXT PRIMARY KEY,
+        receipt_verification_key TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS dossier_proposals (
+        dossier_id TEXT NOT NULL,
+        content_fingerprint TEXT NOT NULL,
+        evaluation_id TEXT NOT NULL,
+        call_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target TEXT,
+        payload TEXT,
+        evidence TEXT NOT NULL,
+        raw_dossier_content TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (dossier_id, content_fingerprint)
+    );
+    CREATE TABLE IF NOT EXISTS committed_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        evaluation_id TEXT NOT NULL,
+        dossier_id TEXT NOT NULL,
+        call_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        proposal_digest TEXT NOT NULL,
+        committed_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    cursor.executescript(init_sql)
+    MEM_CONN.commit()
+    print("Virtual In-Memory Database Context successfully provisioned.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from init_db import initialize_database
-    initialize_database()
+    bootstrap_in_memory_tables()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-# --- Pydantic Validation Schemas ---
+# --- Add explicit root endpoint to bypass Render's strict default health checks ---
+@app.get("/")
+async def health_check():
+    return {"status": "healthy", "service": "secure_mailroom_agent"}
+
+# --- Pydantic Strict Data Validation Schemas ---
 class DossierElement(BaseModel):
     id: str
     content: str
@@ -45,7 +87,7 @@ class CommitRequest(BaseModel):
     operation: Literal["commit"]
     receipts: List[CommitReceiptElement]
 
-# --- Target & Payload Layouts ---
+# --- Target & Payload Layout Classes ---
 class DraftTarget(BaseModel):
     kind: Literal["draft_queue"]
     id: str
@@ -111,30 +153,35 @@ def compute_proposal_digest(call_id: str, action: str, target: Any, payload: Any
     return hashlib.sha256(raw_stream).hexdigest()
 
 def call_llm_inference_sandbox(content: str) -> Dict[str, Any]:
+    # Security Sandbox: Flags control instructions or prompt extraction patterns
     if "override" in content.lower() or "system prompt" in content.lower():
         return {
             "action": "quarantine_item",
             "target": {"kind": "security_queue", "id": "mailroom"},
             "payload": {"artifactId": "detected", "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-            "evidence": "Suspicious input detected."
+            "evidence": "Suspicious input pattern matched inside raw content blocks."
         }
     return {
         "action": "no_action",
         "target": None,
         "payload": {"reasonCode": "INFORMATIONAL", "referenceId": "default_ref"},
-        "evidence": "Clean content parsing sequence completed."
+        "evidence": "Clean content parsing segment completed."
     }
 
+# --- Core Public Envelope Endpoint Router Layer ---
 @app.post("/mailroom/endpoint")
 async def handle_mailroom_operations(request_data: Dict[str, Any]):
     operation = request_data.get("operation")
     if not operation:
-        raise HTTPException(status_code=400, detail="Missing operation parameter.")
+        raise HTTPException(status_code=400, detail="Missing operation structural layout parameter.")
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
+        # =====================================================================
+        # ENVELOPE PIPELINE MODE: PROPOSE
+        # =====================================================================
         if operation == "propose":
             try:
                 req = ProposeRequest(**request_data)
@@ -144,7 +191,7 @@ async def handle_mailroom_operations(request_data: Dict[str, Any]):
             seen_ids = set()
             for d in req.dossiers:
                 if d.id in seen_ids:
-                    raise HTTPException(status_code=400, detail=f"Duplicate dossier structural element detected: {d.id}")
+                    raise HTTPException(status_code=400, detail=f"Duplicate dossier structural element: {d.id}")
                 seen_ids.add(d.id)
 
             cursor.execute("SELECT receipt_verification_key FROM evaluation_state WHERE evaluation_id = ?", (req.evaluationId,))
@@ -188,7 +235,7 @@ async def handle_mailroom_operations(request_data: Dict[str, Any]):
                             action="quarantine_item",
                             target={"kind": "security_queue", "id": "mailroom"},
                             payload={"artifactId": dossier.id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-                            evidence="Validation processing exception handling triggered."
+                            evidence="Automated validation parsing exception handled."
                         )
 
                     generated_call_id = f"call_{uuid.uuid4().hex[:16]}"
@@ -198,54 +245,5 @@ async def handle_mailroom_operations(request_data: Dict[str, Any]):
                         (dossier_id, content_fingerprint, evaluation_id, call_id, action, target, payload, evidence, raw_dossier_content) 
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
                     
-                    cursor.execute(sql_ins, (dossier.id, fingerprint, req.evaluationId, generated_call_id, p_data["action"], json.dumps(p_data["target"]), json.dumps(p_data["payload"]), p_data["evidence"], dossier.content))
-
-                    proposals_out.append({
-                        "dossierId": dossier.id,
-                        "callId": generated_call_id,
-                        "action": p_data["action"],
-                        "target": p_data["target"],
-                        "payload": p_data["payload"],
-                        "evidence": p_data["evidence"]
-                    })
-
-            conn.commit()
-            return {"status": "awaiting_receipts", "proposals": proposals_out}
-
-        elif operation == "commit":
-            try:
-                req = CommitRequest(**request_data)
-            except ValidationError as e:
-                raise HTTPException(status_code=422, detail=e.errors())
-
-            outcomes_out = []
-
-            for receipt in req.receipts:
-                cursor.execute("SELECT 1 FROM evaluation_state WHERE evaluation_id = ?", (receipt.evaluationId,))
-                if not cursor.fetchone():
-                    raise HTTPException(status_code=400, detail="Unknown evaluation identifier execution.")
-
-                cursor.execute("SELECT call_id, action, target, payload FROM dossier_proposals WHERE dossier_id = ? AND call_id = ?", (receipt.dossierId, receipt.callId))
-                saved = cursor.fetchone()
-                if not saved:
-                    raise HTTPException(status_code=400, detail="Missing original historical state layout reference.")
-
-                t_saved = json.loads(saved["target"]) if isinstance(saved["target"], str) else saved["target"]
-                p_saved = json.loads(saved["payload"]) if isinstance(saved["payload"], str) else saved["payload"]
-
-                expected_digest = compute_proposal_digest(saved["call_id"], saved["action"], t_saved, p_saved)
-if receipt.proposalDigest != expected_digest or receipt.action != saved["action"]:raise HTTPException(status_code=400, detail="Cryptographic verification matching anomaly detected.")cursor.execute("SELECT 1 FROM committed_receipts WHERE receipt_id = ?", (receipt.receiptId,))if not cursor.fetchone():sql_commit = "INSERT INTO committed_receipts (receipt_id, evaluation_id, dossier_id, call_id, action, proposal_digest) VALUES (?, ?, ?, ?, ?, ?)"cursor.execute(sql_commit, (receipt.receiptId, receipt.evaluationId, receipt.dossierId, receipt.callId, receipt.action, receipt.proposalDigest))outcomes_out.append({"receiptId": receipt.receiptId, "status": "executed", "action": saved["action"]})conn.commit()return {"status": "completed", "outcomes": outcomes_out}except Exception as e:conn.rollback()if isinstance(e, HTTPException):raise eraise HTTPException(status_code=500, detail=str(e))finally:cursor.close()conn.close()
-
----
-
-### Step 3: Trigger the Deploy Sequence
-
-1. Delete the `Dockerfile` from your repository entirely if it's still present, as Render's Python runtime performs better with native settings.
-2. Commit and push these updated versions of `main.py` and `init_db.py` to GitHub.
-3. Your Render container will rebuild automatically. Since it can now write safely to the `/tmp` folder, it will clear the gating phase and transition directly to **Live**.
-
----
-
-💡 Once it updates:
-* Copy your service domain from the dashboard and run a query against your public endpoint path **`https://[your-service]://`**. 
-* If you run into any formatting or text exceptions during verification, let me know!
+                    
+cursor.execute(sql_ins, (dossier.id, fingerprint, req.evaluationId, generated_call_id, p_data["action"], json.dumps(p_data["target"]), json.dumps(p_data["payload"]), p_data["evidence"], dossier.content))proposals_out.append({"dossierId": dossier.id,"callId": generated_call_id,"action": p_data["action"],"target": p_data["target"],"payload": p_data["payload"],"evidence": p_data["evidence"]})conn.commit()return {"status": "awaiting_receipts", "proposals": proposals_out}# =====================================================================# ENVELOPE PIPELINE MODE: COMMIT# =====================================================================elif operation == "commit":try:req = CommitRequest(**request_data)except ValidationError as e:raise HTTPException(status_code=422, detail=e.errors())outcomes_out = []for receipt in req.receipts:cursor.execute("SELECT 1 FROM evaluation_state WHERE evaluation_id = ?", (receipt.evaluationId,))if not cursor.fetchone():raise HTTPException(status_code=400, detail="Unknown evaluation identifier reference.")cursor.execute("SELECT call_id, action, target, payload FROM dossier_proposals WHERE dossier_id = ? AND call_id = ?", (receipt.dossierId, receipt.callId))saved = cursor.fetchone()if not saved:raise HTTPException(status_code=400, detail="Missing original historical state layout reference.")t_saved = json.loads(saved["target"]) if isinstance(saved["target"], str) else saved["target"]p_saved = json.loads(saved["payload"]) if isinstance(saved["payload"], str) else saved["payload"]expected_digest = compute_proposal_digest(saved["call_id"], saved["action"], t_saved, p_saved)if receipt.proposalDigest != expected_digest or receipt.action != saved["action"]:raise HTTPException(status_code=400, detail="Cryptographic verification matching anomaly detected.")cursor.execute("SELECT 1 FROM committed_receipts WHERE receipt_id = ?", (receipt.receiptId,))if not cursor.fetchone():sql_commit = "INSERT INTO committed_receipts (receipt_id, evaluation_id, dossier_id, call_id, action, proposal_digest) VALUES (?, ?, ?, ?, ?, ?)"cursor.execute(sql_commit, (receipt.receiptId, receipt.evaluationId, receipt.dossierId, receipt.callId, receipt.action, receipt.proposalDigest))outcomes_out.append({"receiptId": receipt.receiptId, "status": "executed", "action": saved["action"]})conn.commit()return {"status": "completed", "outcomes": outcomes_out}else:raise HTTPException(status_code=400, detail="Unsupported operational mode routing string.")except Exception as e:conn.rollback()if isinstance(e, HTTPException):raise eraise HTTPException(status_code=500, detail=str(e))
