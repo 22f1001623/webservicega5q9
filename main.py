@@ -235,3 +235,17 @@ async def handle_mailroom_operations(request_data: Dict[str, Any]):
 
                 expected_digest = compute_proposal_digest(saved["call_id"], saved["action"], t_saved, p_saved)
 if receipt.proposalDigest != expected_digest or receipt.action != saved["action"]:raise HTTPException(status_code=400, detail="Cryptographic verification matching anomaly detected.")cursor.execute("SELECT 1 FROM committed_receipts WHERE receipt_id = ?", (receipt.receiptId,))if not cursor.fetchone():sql_commit = "INSERT INTO committed_receipts (receipt_id, evaluation_id, dossier_id, call_id, action, proposal_digest) VALUES (?, ?, ?, ?, ?, ?)"cursor.execute(sql_commit, (receipt.receiptId, receipt.evaluationId, receipt.dossierId, receipt.callId, receipt.action, receipt.proposalDigest))outcomes_out.append({"receiptId": receipt.receiptId, "status": "executed", "action": saved["action"]})conn.commit()return {"status": "completed", "outcomes": outcomes_out}except Exception as e:conn.rollback()if isinstance(e, HTTPException):raise eraise HTTPException(status_code=500, detail=str(e))finally:cursor.close()conn.close()
+
+---
+
+### Step 3: Trigger the Deploy Sequence
+
+1. Delete the `Dockerfile` from your repository entirely if it's still present, as Render's Python runtime performs better with native settings.
+2. Commit and push these updated versions of `main.py` and `init_db.py` to GitHub.
+3. Your Render container will rebuild automatically. Since it can now write safely to the `/tmp` folder, it will clear the gating phase and transition directly to **Live**.
+
+---
+
+💡 Once it updates:
+* Copy your service domain from the dashboard and run a query against your public endpoint path **`https://[your-service]://`**. 
+* If you run into any formatting or text exceptions during verification, let me know!
